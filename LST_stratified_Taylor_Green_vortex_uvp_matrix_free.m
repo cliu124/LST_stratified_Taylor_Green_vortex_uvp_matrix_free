@@ -83,6 +83,7 @@ if solve_eig
             
             fprintf('Completed Fr=%g, kz=%g, eigs flag=%d.\n', ...
                 params.Fr,params.kz,eig_flag);
+            flag{Fr_ind,kz_ind}=eig_flag;
         end
     end
     
