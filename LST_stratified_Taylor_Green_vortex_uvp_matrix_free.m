@@ -1,21 +1,26 @@
-clear;
+clear all;
 close all;
 clc;
 
 solve_eig=1;%if solve_eig=1, it will solve eigenvalue problem. Otherwise, it will jump to post-processing
 save_results=1;%whether we want to save results. Note this may overwrite existing data
-post_growth_rate=1;%post-processing of growth rate
+post_growth_rate=0;%post-processing of growth rate
 post_eigenvector=1;%post-processing of eigenvectors
+post_growth_rate_GTZ2024_only=0; %only plotting the growth rate from GTZ 2024 paper. 
+post_eigenvector_ReIm='complex'; %'complex' %option to select the eigenvectors corresponding to real or complex eigenvalues. 
+
+%pick one of the operator from the cell. 
+params.operator='A0_adj_viscous';%{'A_full','A0','A0_viscous','A0_adj','A0_adj_viscous'};%pick one of these
 
 params.Re=1600;%Reynolds number
 params.Pr=0.7;%Prandtl number
 
-Fr_list=[1,0.5,0.25,0.125];
-kz_list=1:1:19;
+Fr_list=0.125;%[1,0.5,0.25,0.125];
+kz_list=0.0001;%3;%1:1:19;
 
 %resolution in x and y
-params.Nx=64;
-params.Ny=64;
+params.Nx=128;
+params.Ny=128;
 params.N=params.Nx*params.Ny;
 
 %domain size. In default, they are both 2pi
@@ -45,10 +50,10 @@ params.dVdx=sin(X).*sin(Y);
 params.dVdy=-cos(X).*cos(Y);
 
 stationary_tolerance=1e-6;
-num_eigenvalues=6;
+num_eigenvalues=10;
 
 outer_options.tol=1e-6;
-outer_options.maxit=600;
+outer_options.maxit=1000;
 outer_options.p=50;
 outer_options.disp=0; %whether you want to display all iterations
 outer_options.isreal=false;
@@ -58,42 +63,45 @@ if solve_eig
     for kz_ind=1:length(kz_list)
         params.kz=kz_list(kz_ind);
         
-        % Delta=dxx+dyy-kz^2 changes with kz, so its Fourier-mode LU factors
-        % must be rebuilt whenever kz changes.  The factors do not depend on Fr
-        % and are reused for every Froude number at this kz.
-        params=add_laplacian_inverse(params);
         
         for Fr_ind=1:length(Fr_list)
             params.Fr=Fr_list(Fr_ind);
             solve_options=outer_options;
             
-            % Seed eigs with the leading retained Ritz vector from the previous
-            % kz.
-            if kz_ind>1 && ~isempty(eigvec{Fr_ind,kz_ind-1})
-                solve_options.v0=eigvec{Fr_ind,kz_ind-1}(:,1);
-            else
-                solve_options.v0=randn(3*params.N,1)+1i*randn(3*params.N,1);
+            switch params.operator
+                case 'A_full'
+                    A_dim=3*params.N;
+                case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
+                    A_dim=2*params.N;
+                    params.kz=0; %enforce kz=0 for A0 or A0 adjoint operators 
+                otherwise
+                    error('Wrong flag of operator');
             end
-            solve_options.v0=solve_options.v0/norm(solve_options.v0);
+            
+            % Delta=dxx+dyy-kz^2 changes with kz, so its Fourier-mode LU factors
+            % must be rebuilt whenever kz changes.  The factors do not depend on Fr
+            % and are reused for every Froude number at this kz.
+            % Add the lu decomposition of the laplacian operator to compute
+            % the inverse. 
+            params=add_laplacian_inverse(params);
             
             %the core eigs solver.
             [eigvec{Fr_ind,kz_ind},eigval{Fr_ind,kz_ind},eig_flag]=eigs( ...
-                @(q) apply_A(q,params),3*params.N,num_eigenvalues, ...
+                @(q) apply_A(q,params),A_dim,num_eigenvalues, ...
                 'largestreal',solve_options);
-            
+            flag{Fr_ind,kz_ind}=eig_flag;
             fprintf('Completed Fr=%g, kz=%g, eigs flag=%d.\n', ...
                 params.Fr,params.kz,eig_flag);
-            flag{Fr_ind,kz_ind}=eig_flag;
         end
     end
     
     if save_results
-        save(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'.mat'],'eigval','eigvec','flag');
+        save(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
     end
 end
 
 if post_growth_rate
-    load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'.mat'],'eigval','eigvec','flag');
+    load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
     
     % Post-process all retained modes. Figure 2(a) follows the stationary
     % branch, for which imag(sigma)=0. Nothing returned by eigs is discarded.
@@ -105,7 +113,7 @@ if post_growth_rate
             
             %identify the stationary modes.
             stationary_indices=find( ...
-                abs(imag(lambda_all))<stationary_tolerance);
+                abs(imag(lambda_all))<stationary_tolerance & abs(lambda_all)<10^14);
             
             if isempty(stationary_indices)
                 warning(['No stationary eigenvalue found at Fr=%g, kz=%g. ' ...
@@ -139,6 +147,7 @@ if post_growth_rate
     end
     data=GTZ2024(data); %Add the data from Guo Taylor, Zhou (2024) JFM paper
     
+    
     if length(Fr_list)>1
         plot_config.legend_list={1};
         for Fr_ind=1:length(Fr_list)
@@ -149,33 +158,108 @@ if post_growth_rate
     plot_config.label_list={1,'$k_z$','$\sigma_r$'};
     plot_config.Markerindex=3;
     plot_config.fontsize_legend=34;
+    
+    %plot_config.user_color_style_marker_list=...
+    %    {'-b','bdiamond','r^','*k','msquare'};
+    
     plot_config.user_color_style_marker_list=...
         {'-b','--r','-.k',':m','bdiamond','r^','*k','msquare'};
+    
     plot_config.name='growth_rate_validation_GTZ2024.png';
     plot_line(data,plot_config);
 end
 
+
+if post_growth_rate_GTZ2024_only
+    data={};
+    data=GTZ2024(data); %Add the data from Guo Taylor, Zhou (2024) JFM paper
+
+    Fr_list=[1,0.5,0.25,0.125];
+    if length(Fr_list)>1
+        plot_config.legend_list={1};
+        for Fr_ind=1:length(Fr_list)
+            Fr=Fr_list(Fr_ind);
+            plot_config.legend_list{Fr_ind+1}=['Fr=',num2str(Fr)];
+            data{Fr_ind}.x=data{Fr_ind}.x*Fr;
+        end
+    end
+    data{5}.x=data{4}.x;
+    data{5}.y=0.25*data{5}.x.^(1);
+    plot_config.legend_list{length(plot_config.legend_list)+1}=['fit'];
+    plot_config.loglog=[1,1];
+    plot_config.label_list={1,'$k_zFr$','$\sigma_r$'};
+    plot_config.Markerindex=3;
+    plot_config.fontsize_legend=34;
+    
+    plot_config.user_color_style_marker_list=...
+       {'bdiamond','r^','*k','msquare','b--'};
+   
+    plot_config.name='growth_rate_GTZ2024_only.png';
+    plot_line(data,plot_config);
+    
+end
+
+
 if post_eigenvector
+%     load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
+
     clear data plot_config;
     data{1}.x=params.x;
     data{1}.y=params.y;
     plot_config.label_list={1,'$x$','$y$'};
-    variable_list={'u','v','rho','w','omega_z'};
     for Fr_ind=1:length(Fr_list)
         for kz_ind=1:length(kz_list)
             Fr=Fr_list(Fr_ind);
             kz=kz_list(kz_ind);
             selected_vector=eigvec{Fr_ind,kz_ind};
-            eigvec_mat{Fr_ind,kz_ind}.u=reshape(selected_vector(1:params.N),[params.Ny,params.Nx]);
-            eigvec_mat{Fr_ind,kz_ind}.v=reshape(selected_vector(params.N+1:2*params.N),[params.Ny,params.Nx]);
-            eigvec_mat{Fr_ind,kz_ind}.rho=reshape(selected_vector(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
-            eigvec_mat{Fr_ind,kz_ind}.w=-1/(1i*params.kz)*(dx(eigvec_mat{Fr_ind,kz_ind}.u,params)+dy(eigvec_mat{Fr_ind,kz_ind}.v,params));
+            
+            %identify the stationary modes.
+            lambda_all=diag(eigval{Fr_ind,kz_ind});
+            if strcmp(post_eigenvector_ReIm,'complex')
+                %select eigenvectors associated with complex eigenvalues. 
+                stationary_indices=find( ...
+                abs(imag(lambda_all))>stationary_tolerance & abs(lambda_all)<10^14);
+            
+            else 
+                %In default, let us select the eigenvector corresponding to
+                %real eigenvalues. 
+                stationary_indices=find( ...
+                    abs(imag(lambda_all))<stationary_tolerance & abs(lambda_all)<10^14);
+            
+            end
+            if isempty(stationary_indices)
+                warning(['No stationary eigenvalue found at Fr=%g, kz=%g. ' ...
+                    'Using the retained mode with largest real part for plots.'], ...
+                    params.Fr,params.kz);
+                [~,selected_index]=max(real(lambda_all));
+            else
+                %select the mode with the largest growth rate among
+                %stationary mode.
+                [~,index_within_stationary]=max( ...
+                    real(lambda_all(stationary_indices)));
+                selected_index=stationary_indices(index_within_stationary);
+            end
+            
+            stationary_mode_index{Fr_ind,kz_ind}=selected_index;
+            stationary_eigval{Fr_ind,kz_ind}=lambda_all(selected_index);
+            stationary_eigvec{Fr_ind,kz_ind}= ...
+                eigvec{Fr_ind,kz_ind}(:,selected_index);
+            
+            eigvec_mat{Fr_ind,kz_ind}.u=reshape(stationary_eigvec{Fr_ind,kz_ind}(1:params.N),[params.Ny,params.Nx]);
+            eigvec_mat{Fr_ind,kz_ind}.v=reshape(stationary_eigvec{Fr_ind,kz_ind}(params.N+1:2*params.N),[params.Ny,params.Nx]);
             eigvec_mat{Fr_ind,kz_ind}.omega_z=dx(eigvec_mat{Fr_ind,kz_ind}.v,params)-dy(eigvec_mat{Fr_ind,kz_ind}.u,params);
+            variable_list={'u','v','omega_z'};
+            
+            if strcmp(params.operator,'A_full')
+                variable_list={'u','v','rho','w','omega_z'};
+                eigvec_mat{Fr_ind,kz_ind}.rho=reshape(stationary_eigvec{Fr_ind,kz_ind}(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
+                eigvec_mat{Fr_ind,kz_ind}.w=-1/(1i*params.kz)*(dx(eigvec_mat{Fr_ind,kz_ind}.u,params)+dy(eigvec_mat{Fr_ind,kz_ind}.v,params));
+            end
             
             for variable_ind=1:length(variable_list)
                 variable=variable_list{variable_ind};
                 data{1}.z=real(eigvec_mat{Fr_ind,kz_ind}.(variable));
-                plot_config.name=['eigenvector_Fr=',num2str(Fr),'_kz=',num2str(kz),'_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',variable,'.png'];
+                plot_config.name=['eigenvector_Fr=',num2str(Fr),'_kz=',num2str(kz),'_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',variable,'_',params.operator,'.png'];
                 plot_config.print_size=[1,900,800];
                 if strcmp(variable,'rho')
                     plot_config.title_list={1,'$\rho$'};
@@ -197,14 +281,39 @@ function y=apply_A(q,params)
 % B matrix is blkdiag(laplacian, laplacian, I)
 %Here B is the LHS of the (2.10) of Guo J, Taylor JR, Zhou Q. Zigzag instability of columnar Taylor–Green vortices in a strongly stratified fluid. Journal of Fluid Mechanics. 2024 Oct;997:A34.
 
-rhs=apply_raw_A(q,params);
-N=params.N;
+if strcmp(params.operator,'A_full')
+    rhs=apply_raw_A_full(q,params);
+    N=params.N;
 
-u=laplacian_1d_fft_solve(rhs(1:N),params);
-v=laplacian_1d_fft_solve(rhs(N+1:2*N),params);
-% The third diagonal block of B is the identity.
-rho=rhs(2*N+1:3*N);
-y=[u;v;rho];
+    u=laplacian_1d_fft_solve(rhs(1:N),params);
+    v=laplacian_1d_fft_solve(rhs(N+1:2*N),params);
+    % The third diagonal block of B is the identity.
+    rho=rhs(2*N+1:3*N);
+    y=[u;v;rho];
+else
+    switch params.operator
+        case 'A0'
+            rhs=apply_raw_A0(q,params);
+        case 'A0_viscous'
+            rhs=apply_raw_A0_viscous(q,params);
+
+        case 'A0_adj'
+            error('This option is not implemented.');
+
+        case 'A0_adj_viscous'
+            rhs=apply_raw_A0_adj_viscous(q,params);
+
+        otherwise 
+            error('Wrong params.operator.');
+    end
+    N=params.N;
+    u=laplacian_1d_fft_solve(rhs(1:N),params);
+    v=laplacian_1d_fft_solve(rhs(N+1:2*N),params);
+    y=[u;v];
+    
+end
+    
+    
 end
 
 function params=add_laplacian_inverse(params)
@@ -219,8 +328,19 @@ params.laplacian_1d_factors=cell(Nx,1);
 for kx_ind=1:Nx
     kx=(2*pi/params.Lx)*wave(kx_ind);
     laplacian_k=params.Dyy-(kx^2+params.kz^2)*eye(Ny);
-    params.laplacian_1d_factors{kx_ind}= ...
-        decomposition(laplacian_k,'lu');
+    if kx==0 && params.kz==0
+        
+        %for kx=kz=0 mode, also add the regularity ones(Ny)/Ny matrix that
+        %will remove the mean value of the RHS and do not influence other
+        %modes. 
+        params.laplacian_1d_factors{kx_ind}= ...
+            decomposition(laplacian_k+ones(Ny)/Ny,'lu');
+        
+    else
+        params.laplacian_1d_factors{kx_ind}= ...
+            decomposition(laplacian_k,'lu');
+    end
+
 end
 
 end
@@ -231,6 +351,9 @@ function z=laplacian_1d_fft_solve(rhs,params)
 
 Ny=params.Ny;
 Nx=params.Nx;
+
+% %this is the original fft inverse
+% %------------
 rhs_hat=fft(reshape(rhs,Ny,Nx),[],2);
 z_hat=zeros(Ny,Nx,'like',rhs_hat);
 
@@ -238,8 +361,8 @@ for kx_ind=1:Nx
     z_hat(:,kx_ind)= ...
         params.laplacian_1d_factors{kx_ind}\rhs_hat(:,kx_ind);
 end
-
 z=reshape(ifft(z_hat,[],2),Ny*Nx,1);
+%------------------
 
 end
 
@@ -251,7 +374,7 @@ N2=(-Nx/2)*ones(rem(Nx+1,2));
 wave=[0:N1 N2 -N1:-1].';
 end
 
-function Aq=apply_raw_A(q,params)
+function Aq=apply_raw_A_full(q,params)
 % Matrix-free action of the original generalized-eigenproblem matrix A.
 %This is applying the L matrix based on (2.11) of Guo J, Taylor JR, Zhou Q. Zigzag instability of columnar Taylor–Green vortices in a strongly stratified fluid. Journal of Fluid Mechanics. 2024 Oct;997:A34.
 
@@ -298,6 +421,128 @@ A_rho=-(1/(1i*params.kz))*dx(u,params) ...
     +laplacian(rho,params)/(params.Re*params.Pr);
 
 Aq=[A_u(:);A_v(:);A_rho(:)];
+end
+
+function Aq=apply_raw_A0(q,params)
+% Matrix-free action of the original generalized-eigenproblem matrix A.
+% This is applying the L matrix based on (2.11) of Guo J, Taylor JR, Zhou Q. Zigzag instability of columnar Taylor–Green vortices in a strongly stratified fluid. Journal of Fluid Mechanics. 2024 Oct;997:A34.
+% This is based on the leading order A0 RHS term, which remove density and
+% terms associated with w velocity components. 
+
+N=params.N;
+Ny=params.Ny;
+Nx=params.Nx;
+
+u=reshape(q(1:N),Ny,Nx);
+v=reshape(q(N+1:2*N),Ny,Nx);
+
+Adv_u=advection(u,params);
+Adv_v=advection(v,params);
+
+% L_uu*u + L_uv*v, equations (2.11b)-(2.11d).
+f_uu=Adv_u+params.dUdx.*u;
+f_uv=params.dUdy.*v;
+
+%Remove density term and comment out two terms originate from the w
+%component of velociy. 
+A_u=-laplacian(f_uu,params)+dxx(f_uu,params) ...
+    +dxy(params.dVdx.*u,params) ...% -dx(advection(dx(u,params),params),params)+laplacian(laplacian(u,params),params)/params.Re ...
+    -laplacian(f_uv,params)+dxx(f_uv,params) ...
+    +dxy(params.dVdy.*v+Adv_v,params); %-dx(advection(dy(v,params),params),params)+(1i*params.kz/params.Fr^2)*dx(rho,params);
+
+
+% L_vu*u + L_vv*v + L_v_rho*rho, equations (2.11e)-(2.11g).
+f_vu=params.dVdx.*u;
+f_vv=params.dVdy.*v+Adv_v;
+A_v=-laplacian(f_vu,params)+dyy(f_vu,params) ...
+    +dyx(params.dUdx.*u+Adv_u,params) ...%-dy(advection(dx(u,params),params),params) ...
+    -laplacian(f_vv,params)+dyy(f_vv,params) ...
+    +dxy(params.dUdy.*v,params);% -dy(advection(dy(v,params),params),params) ...  +laplacian(laplacian(v,params),params)/params.Re;% +(1i*params.kz/params.Fr^2)*dy(rho,params);
+
+%remove the A_rho completely. 
+Aq=[A_u(:);A_v(:)];
+end
+
+function Aq=apply_raw_A0_viscous(q,params)
+% Matrix-free action of the A0 operator at the limit of kxFr->0. 
+% This limit filters out the w and density equation. Thus, the matrix size
+% will be 2*2. We still use the same technique to remove pressure to avoide
+% singular B matrix of generalized eigenvalue problem. 
+
+N=params.N;
+Ny=params.Ny;
+Nx=params.Nx;
+
+u=reshape(q(1:N),Ny,Nx);
+v=reshape(q(N+1:2*N),Ny,Nx);
+
+Adv_u=advection(u,params);
+Adv_v=advection(v,params);
+
+% L_uu*u + L_uv*v, equations (2.11b)-(2.11d).
+f_uu=Adv_u+params.dUdx.*u;
+f_uv=params.dUdy.*v;
+
+%Remove density term and comment out two terms originate from the w
+%component of velociy. 
+A_u=-laplacian(f_uu,params)+dxx(f_uu,params) ...
+    +dxy(params.dVdx.*u,params) ...% -dx(advection(dx(u,params),params),params) ...
+    +laplacian(laplacian(u,params),params)/params.Re ...
+    -laplacian(f_uv,params)+dxx(f_uv,params) ...
+    +dxy(params.dVdy.*v+Adv_v,params); %-dx(advection(dy(v,params),params),params)+(1i*params.kz/params.Fr^2)*dx(rho,params);
+
+
+% L_vu*u + L_vv*v + L_v_rho*rho, equations (2.11e)-(2.11g).
+f_vu=params.dVdx.*u;
+f_vv=params.dVdy.*v+Adv_v;
+A_v=-laplacian(f_vu,params)+dyy(f_vu,params) ...
+    +dyx(params.dUdx.*u+Adv_u,params) ...%-dy(advection(dx(u,params),params),params) ...
+    -laplacian(f_vv,params)+dyy(f_vv,params) ...
+    +dxy(params.dUdy.*v,params) ...% -dy(advection(dy(v,params),params),params) ...
+    +laplacian(laplacian(v,params),params)/params.Re; %    +(1i*params.kz/params.Fr^2)*dy(rho,params);
+
+%remove the A_rho completely. 
+Aq=[A_u(:);A_v(:)];
+end
+
+function Aq=apply_raw_A0_adj_viscous(q,params)
+%Adjoint of A0 operator, based on the equation derived by Saandeep using
+%the same technique to remove the pressure. 
+
+N=params.N;
+Ny=params.Ny;
+Nx=params.Nx;
+
+u=reshape(q(1:N),Ny,Nx);
+v=reshape(q(N+1:2*N),Ny,Nx);
+
+Adv_u=advection(u,params);
+Adv_v=advection(v,params);
+
+% L_uu*u + L_uv*v, equations (2.11b)-(2.11d).
+f_uu=-Adv_u+params.dUdx.*u;
+f_uv=params.dVdx.*v;
+
+%Remove density term and comment out two terms originate from the w
+%component of velociy. 
+A_u=-laplacian(f_uu,params)+dxx(f_uu,params) ...
+    +dxy(params.dUdy.*u,params) ...% -dx(advection(dx(u,params),params),params) ...
+    +laplacian(laplacian(u,params),params)/params.Re ...
+    -laplacian(f_uv,params)+dxx(f_uv,params) ...
+    +dxy(params.dVdy.*v-Adv_v,params); %-dx(advection(dy(v,params),params),params)+(1i*params.kz/params.Fr^2)*dx(rho,params);
+
+
+% L_vu*u + L_vv*v + L_v_rho*rho, equations (2.11e)-(2.11g).
+f_vu=params.dUdy.*u;
+f_vv=params.dVdy.*v-Adv_v;
+A_v=-laplacian(f_vu,params)+dyy(f_vu,params) ...
+    +dyx(params.dUdx.*u-Adv_u,params) ...%-dy(advection(dx(u,params),params),params) ...
+    -laplacian(f_vv,params)+dyy(f_vv,params) ...
+    +dxy(params.dVdx.*v,params) ...% -dy(advection(dy(v,params),params),params) ...
+    +laplacian(laplacian(v,params),params)/params.Re; %    +(1i*params.kz/params.Fr^2)*dy(rho,params);
+
+%remove the A_rho completely. 
+Aq=[A_u(:);A_v(:)];
 end
 
 function value=advection(f,params)
