@@ -10,7 +10,9 @@ post_growth_rate_GTZ2024_only=0; %only plotting the growth rate from GTZ 2024 pa
 post_eigenvector_ReIm='complex'; %'complex' %option to select the eigenvectors corresponding to real or complex eigenvalues. 
 
 %pick one of the operator from the cell. 
-params.operator='A0_adj_viscous';%{'A_full','A0','A0_viscous','A0_adj','A0_adj_viscous'};%pick one of these
+params.operator='A_full';%{'A_full','A0','A0_viscous','A0_adj','A0_adj_viscous'};%pick one of these
+params.basis='no_pressure';%{'primitive','no_pressure'}; The 'primitive' option uses u, v, w, p, b as variables. The 'no_pressure' option eliminate pressure variable
+%params.eig_ref=0.225+1e-3*1i; %reference eigenvalue, for the case params.basis='primitive'
 
 params.Re=1600;%Reynolds number
 params.Pr=0.7;%Prandtl number
@@ -19,8 +21,8 @@ Fr_list=0.125;%[1,0.5,0.25,0.125];
 kz_list=0.0001;%3;%1:1:19;
 
 %resolution in x and y
-params.Nx=128;
-params.Ny=128;
+params.Nx=64;
+params.Ny=64;
 params.N=params.Nx*params.Ny;
 
 %domain size. In default, they are both 2pi
@@ -52,13 +54,29 @@ params.dVdy=-cos(X).*cos(Y);
 stationary_tolerance=1e-6;
 num_eigenvalues=10;
 
-outer_options.tol=1e-6;
-outer_options.maxit=1000;
-outer_options.p=50;
-outer_options.disp=0; %whether you want to display all iterations
-outer_options.isreal=false;
-outer_options.issym=false;
+if strcmp(params.basis,'no_pressure')
+    outer_options.tol=1e-6;
+    outer_options.maxit=1000;
+    outer_options.p=50;
+    outer_options.disp=0; %whether you want to display all iterations
+    outer_options.isreal=false;
+    outer_options.issym=false;
 
+elseif strcmp(params.basis,'primitive')
+    outer_options.tol=1e-6;
+    outer_options.maxit=1000;
+    outer_options.p=50;
+    outer_options.disp=1; %whether you want to display all iterations
+    outer_options.isreal=false;
+    outer_options.issym=false;
+
+    % With a numeric target eig_ref, eigs requires its function handle to
+    % apply (A-eig_ref*B)^(-1), not A itself.  These options control the
+    % inner GMRES solve used by apply_primitive_A.
+    params.gmres_restart=50;
+    params.gmres_tol=1e-8;
+    params.gmres_maxit=2000;
+end
 if solve_eig
     for kz_ind=1:length(kz_list)
         params.kz=kz_list(kz_ind);
@@ -67,28 +85,63 @@ if solve_eig
         for Fr_ind=1:length(Fr_list)
             params.Fr=Fr_list(Fr_ind);
             solve_options=outer_options;
-            
-            switch params.operator
-                case 'A_full'
-                    A_dim=3*params.N;
-                case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
-                    A_dim=2*params.N;
-                    params.kz=0; %enforce kz=0 for A0 or A0 adjoint operators 
-                otherwise
-                    error('Wrong flag of operator');
+            if strcmp(params.basis,'no_pressure')
+                switch params.operator
+                    case 'A_full'
+                        A_dim=3*params.N;
+                    case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
+                        A_dim=2*params.N;
+                        params.kz=0; %enforce kz=0 for A0 or A0 adjoint operators 
+                    otherwise
+                        error('Wrong flag of operator');
+                end
+
+                % Delta=dxx+dyy-kz^2 changes with kz, so its Fourier-mode LU factors
+                % must be rebuilt whenever kz changes.  The factors do not depend on Fr
+                % and are reused for every Froude number at this kz.
+                % Add the lu decomposition of the laplacian operator to compute
+                % the inverse. 
+                params=add_laplacian_inverse(params);
+
+                %the core eigs solver.
+                [eigvec{Fr_ind,kz_ind},eigval{Fr_ind,kz_ind},eig_flag]=eigs( ...
+                    @(q) apply_A(q,params),A_dim,num_eigenvalues, ...
+                    'largestreal',solve_options);
+
+            elseif strcmp(params.basis,'primitive')
+                error('The branch with params.basis=primitive is not ready to use. The results do not converge right now.')
+                switch params.operator
+                    case 'A_full'
+                        A_dim=5*params.N;
+                        I=speye(params.N);
+                        zero=spalloc(params.N,params.N,params.N);
+
+                        B=blkdiag(I,I,I,zero,I);
+                    case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
+                        A_dim=3*params.N;
+                        params.kz=0; %enforce kz=0 for A0 or A0 adjoint operators 
+                        I=speye(params.N);
+                        zero=spalloc(params.N,params.N,params.N);
+
+                        B=blkdiag(I,I,zero);
+                    otherwise
+                        error('Wrong flag of operator');
+                end
+
+                % Build the Fourier-mode Laplacian factors used by the
+                % primitive-variable GMRES block preconditioner.
+                params=add_laplacian_inverse(params);
+
+                %the core eigs solver.
+                [eigvec{Fr_ind,kz_ind},eigval{Fr_ind,kz_ind},eig_flag]=eigs( ...
+                    @(q) apply_primitive_A(q,params),A_dim,B,num_eigenvalues, params.eig_ref,solve_options);
+
+            else 
+                error('Wrong params.basis')
+                
             end
             
-            % Delta=dxx+dyy-kz^2 changes with kz, so its Fourier-mode LU factors
-            % must be rebuilt whenever kz changes.  The factors do not depend on Fr
-            % and are reused for every Froude number at this kz.
-            % Add the lu decomposition of the laplacian operator to compute
-            % the inverse. 
-            params=add_laplacian_inverse(params);
             
-            %the core eigs solver.
-            [eigvec{Fr_ind,kz_ind},eigval{Fr_ind,kz_ind},eig_flag]=eigs( ...
-                @(q) apply_A(q,params),A_dim,num_eigenvalues, ...
-                'largestreal',solve_options);
             flag{Fr_ind,kz_ind}=eig_flag;
             fprintf('Completed Fr=%g, kz=%g, eigs flag=%d.\n', ...
                 params.Fr,params.kz,eig_flag);
@@ -96,12 +149,12 @@ if solve_eig
     end
     
     if save_results
-        save(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
+        save(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag','params');
     end
 end
 
 if post_growth_rate
-    load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
+    load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag','params');
     
     % Post-process all retained modes. Figure 2(a) follows the stationary
     % branch, for which imag(sigma)=0. Nothing returned by eigs is discarded.
@@ -111,7 +164,9 @@ if post_growth_rate
             params.kz=kz_list(kz_ind);
             lambda_all=diag(eigval{Fr_ind,kz_ind});
             
-            %identify the stationary modes.
+            %identify the stationary modes for the purpose of reproducing
+            %the paper from Guo, Taylor, Zhou (2024)
+            
             stationary_indices=find( ...
                 abs(imag(lambda_all))<stationary_tolerance & abs(lambda_all)<10^14);
             
@@ -201,7 +256,7 @@ end
 
 
 if post_eigenvector
-%     load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag');
+    %load(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag','params');
 
     clear data plot_config;
     data{1}.x=params.x;
@@ -211,23 +266,23 @@ if post_eigenvector
         for kz_ind=1:length(kz_list)
             Fr=Fr_list(Fr_ind);
             kz=kz_list(kz_ind);
-            selected_vector=eigvec{Fr_ind,kz_ind};
+            %selected_vector=eigvec{Fr_ind,kz_ind};
             
             %identify the stationary modes.
             lambda_all=diag(eigval{Fr_ind,kz_ind});
             if strcmp(post_eigenvector_ReIm,'complex')
                 %select eigenvectors associated with complex eigenvalues. 
-                stationary_indices=find( ...
+                selection_group_indices=find( ...
                 abs(imag(lambda_all))>stationary_tolerance & abs(lambda_all)<10^14);
             
             else 
                 %In default, let us select the eigenvector corresponding to
                 %real eigenvalues. 
-                stationary_indices=find( ...
+                selection_group_indices=find( ...
                     abs(imag(lambda_all))<stationary_tolerance & abs(lambda_all)<10^14);
             
             end
-            if isempty(stationary_indices)
+            if isempty(selection_group_indices)
                 warning(['No stationary eigenvalue found at Fr=%g, kz=%g. ' ...
                     'Using the retained mode with largest real part for plots.'], ...
                     params.Fr,params.kz);
@@ -236,46 +291,112 @@ if post_eigenvector
                 %select the mode with the largest growth rate among
                 %stationary mode.
                 [~,index_within_stationary]=max( ...
-                    real(lambda_all(stationary_indices)));
-                selected_index=stationary_indices(index_within_stationary);
+                    real(lambda_all(selection_group_indices)));
+                selected_index=selection_group_indices(index_within_stationary);
             end
             
-            stationary_mode_index{Fr_ind,kz_ind}=selected_index;
-            stationary_eigval{Fr_ind,kz_ind}=lambda_all(selected_index);
-            stationary_eigvec{Fr_ind,kz_ind}= ...
+            selected_mode_index{Fr_ind,kz_ind}=selected_index;
+            selected_eigval{Fr_ind,kz_ind}=lambda_all(selected_index);
+            selected_eigvec{Fr_ind,kz_ind}= ...
                 eigvec{Fr_ind,kz_ind}(:,selected_index);
-            
-            eigvec_mat{Fr_ind,kz_ind}.u=reshape(stationary_eigvec{Fr_ind,kz_ind}(1:params.N),[params.Ny,params.Nx]);
-            eigvec_mat{Fr_ind,kz_ind}.v=reshape(stationary_eigvec{Fr_ind,kz_ind}(params.N+1:2*params.N),[params.Ny,params.Nx]);
-            eigvec_mat{Fr_ind,kz_ind}.omega_z=dx(eigvec_mat{Fr_ind,kz_ind}.v,params)-dy(eigvec_mat{Fr_ind,kz_ind}.u,params);
-            variable_list={'u','v','omega_z'};
-            
-            if strcmp(params.operator,'A_full')
-                variable_list={'u','v','rho','w','omega_z'};
-                eigvec_mat{Fr_ind,kz_ind}.rho=reshape(stationary_eigvec{Fr_ind,kz_ind}(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
-                eigvec_mat{Fr_ind,kz_ind}.w=-1/(1i*params.kz)*(dx(eigvec_mat{Fr_ind,kz_ind}.u,params)+dy(eigvec_mat{Fr_ind,kz_ind}.v,params));
+            if strcmp(params.basis,'no_pressure')
+                eigvec_mat{Fr_ind,kz_ind}.u=reshape(selected_eigvec{Fr_ind,kz_ind}(1:params.N),[params.Ny,params.Nx]);
+                eigvec_mat{Fr_ind,kz_ind}.v=reshape(selected_eigvec{Fr_ind,kz_ind}(params.N+1:2*params.N),[params.Ny,params.Nx]);
+                eigvec_mat{Fr_ind,kz_ind}.omega_z=dx(eigvec_mat{Fr_ind,kz_ind}.v,params)-dy(eigvec_mat{Fr_ind,kz_ind}.u,params);
+                
+                u=eigvec_mat{Fr_ind,kz_ind}.u;
+                v=eigvec_mat{Fr_ind,kz_ind}.v;
+                
+                switch params.operator
+                    case 'A0_viscous'
+                        variable_list={'u','v','omega_z','p'};
+                        Au=advection(u,params)+params.dUdx.*u+params.dUdy.*v;
+                        Av=advection(v,params)+params.dVdx.*u+params.dVdy.*v;
+                        PPE_RHS=dx(Au,params)+dy(Av,params);
+                        eigvec_mat{Fr_ind,kz_ind}.p=reshape(-laplacian_1d_fft_solve(reshape(PPE_RHS,params.N,1),params),params.Ny,params.Nx);
+                
+                    case 'A0_adj_viscous'
+                        variable_list={'u','v','omega_z','p'};
+                        Au=-advection(u,params)+params.dUdx.*u+params.dVdx.*v;
+                        Av=-advection(v,params)+params.dUdy.*u+params.dVdy.*v;
+                        PPE_RHS=dx(Au,params)+dy(Av,params);
+                        eigvec_mat{Fr_ind,kz_ind}.p=reshape(laplacian_1d_fft_solve(reshape(PPE_RHS,params.N,1),params),params.Ny,params.Nx);
+                
+                    case 'A_full'
+                        
+                        variable_list={'u','v','rho','w','omega_z','p'};
+                        eigvec_mat{Fr_ind,kz_ind}.rho=reshape(selected_eigvec{Fr_ind,kz_ind}(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
+                        eigvec_mat{Fr_ind,kz_ind}.w=-1/(1i*params.kz)*(dx(eigvec_mat{Fr_ind,kz_ind}.u,params)+dy(eigvec_mat{Fr_ind,kz_ind}.v,params));
+
+                        %Update 2026/07/29: add pressure Poisson equation
+                        %solver
+                        Au=advection(u,params)+params.dUdx.*u+params.dUdy.*v;
+                        Av=advection(v,params)+params.dVdy.*v+params.dVdx.*u;
+
+                        w=eigvec_mat{Fr_ind,kz_ind}.w;
+                        Aw=advection(w,params);
+                        PPE_RHS=dx(Au,params)+dy(Av,params)+1i*params.kz*Aw+1/params.Fr^2*1i*params.kz*eigvec_mat{Fr_ind,kz_ind}.rho;
+                        eigvec_mat{Fr_ind,kz_ind}.p=reshape(-laplacian_1d_fft_solve(reshape(PPE_RHS,params.N,1),params),params.Ny,params.Nx);
+                end
+            elseif strcmp(params.basis,'primitive')
+                
+                if strcmp(params.operator,'A_full')
+                    variable_list={'u','v','w','p','omega_z','rho'};
+                    eigvec_mat{Fr_ind,kz_ind}.u=reshape(selected_eigvec{Fr_ind,kz_ind}(1:params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.v=reshape(selected_eigvec{Fr_ind,kz_ind}(params.N+1:2*params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.w=reshape(selected_eigvec{Fr_ind,kz_ind}(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.p=reshape(selected_eigvec{Fr_ind,kz_ind}(3*params.N+1:4*params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.rho=reshape(selected_eigvec{Fr_ind,kz_ind}(4*params.N+1:5*params.N),[params.Ny,params.Nx]);
+%                     eigvec_mat{Fr_ind,kz_ind}.w=-1/(1i*params.kz)*(dx(eigvec_mat{Fr_ind,kz_ind}.u,params)+dy(eigvec_mat{Fr_ind,kz_ind}.v,params));
+                    eigvec_mat{Fr_ind,kz_ind}.omega_z=dx(eigvec_mat{Fr_ind,kz_ind}.v,params)-dy(eigvec_mat{Fr_ind,kz_ind}.u,params);
+
+                else 
+                    eigvec_mat{Fr_ind,kz_ind}.u=reshape(selected_eigvec{Fr_ind,kz_ind}(1:params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.v=reshape(selected_eigvec{Fr_ind,kz_ind}(params.N+1:2*params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.p=reshape(selected_eigvec{Fr_ind,kz_ind}(2*params.N+1:3*params.N),[params.Ny,params.Nx]);
+                    eigvec_mat{Fr_ind,kz_ind}.omega_z=dx(eigvec_mat{Fr_ind,kz_ind}.v,params)-dy(eigvec_mat{Fr_ind,kz_ind}.u,params);
+                    variable_list={'u','v','p','omega_z'};
+
+                end
+            else
+                error('Wroing params.basis');
             end
             
             for variable_ind=1:length(variable_list)
                 variable=variable_list{variable_ind};
+                
                 data{1}.z=real(eigvec_mat{Fr_ind,kz_ind}.(variable));
-                plot_config.name=['eigenvector_Fr=',num2str(Fr),'_kz=',num2str(kz),'_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',variable,'_',params.operator,'.png'];
+                plot_config.name=['eigenvector_Fr=',num2str(Fr),'_kz=',num2str(kz),'_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',variable,'_',params.operator,'_real.png'];
                 plot_config.print_size=[1,900,800];
                 if strcmp(variable,'rho')
-                    plot_config.title_list={1,'$\rho$'};
+                    plot_config.title_list={1,'Re[$\rho$]'};
                 elseif strcmp(variable,'omega_z')
-                    plot_config.title_list={1,'$\omega_z$'};
+                    plot_config.title_list={1,'Re[$\omega_z$]'};
                 else
-                    plot_config.title_list={1,['$',variable,'$']};
+                    plot_config.title_list={1,['Re[$',variable,'$]']};
                 end
                 plot_config.fontsize=28;
+                plot_contour(data,plot_config);
+                
+                data{1}.z=imag(eigvec_mat{Fr_ind,kz_ind}.(variable));
+                plot_config.name=['eigenvector_Fr=',num2str(Fr),'_kz=',num2str(kz),'_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',variable,'_',params.operator,'_imag.png'];
+                if strcmp(variable,'rho')
+                    plot_config.title_list={1,'Im[$\rho$]'};
+                elseif strcmp(variable,'omega_z')
+                    plot_config.title_list={1,'Im[$\omega_z$]'};
+                else
+                    plot_config.title_list={1,['Im[$',variable,'$]']};
+                end
                 plot_contour(data,plot_config);
             end
         end
     end
-    
+    if save_results
+        save(['results_Re=',num2str(params.Re),'_Pr=',num2str(params.Pr),'_',params.operator,'.mat'],'eigval','eigvec','flag','params','eigvec_mat');
+    end
 end
 
+%define the apply_A function for the 'no_pressure' basis. 
 function y=apply_A(q,params)
 % Apply B^(-1)*A to q. B is fixed and nonsingular for kz ~= 0.
 % B matrix is blkdiag(laplacian, laplacian, I)
@@ -543,6 +664,112 @@ A_v=-laplacian(f_vu,params)+dyy(f_vu,params) ...
 
 %remove the A_rho completely. 
 Aq=[A_u(:);A_v(:)];
+end
+
+function y=apply_primitive_A(q,params)
+% Apply (A-sigma*B)^(-1) for the numeric-shift generalized eigs call.
+%
+% MATLAB's function-handle interface for
+%   eigs(Afun,n,B,k,sigma,options)
+% requires Afun(q)=(A-sigma*B)\q when sigma is a nonzero scalar.
+sigma=params.eig_ref;
+shifted_operator=@(x) apply_raw_primitive_A(x,params) ...
+    -sigma*apply_primitive_B(x,params);
+block_preconditioner=@(x) apply_primitive_block_preconditioner(x,params);
+
+[y,gmres_flag,gmres_relres,gmres_iter]=gmres( ...
+    shifted_operator,q,params.gmres_restart,params.gmres_tol, ...
+    params.gmres_maxit,block_preconditioner);
+
+if gmres_flag~=0
+    error(['Inner GMRES failed in apply_primitive_A: flag=%d, ' ...
+        'relative residual=%g, outer iteration=%d, inner iteration=%d. ' ...
+        'Increase the GMRES limits or add a block preconditioner before ' ...
+        'using the returned eigensolution.'], ...
+        gmres_flag,gmres_relres,gmres_iter(1),gmres_iter(2));
+end
+end
+
+function z=apply_primitive_block_preconditioner(rhs,params)
+% Apply an inverse block-diagonal approximation to A-sigma*B.
+%
+% The differential-variable blocks use Delta^(-1), evaluated with the
+% Fourier/LU factors in params.  The algebraic pressure block is left as
+% the identity so that the preconditioner itself remains nonsingular.
+N=params.N;
+
+switch params.operator
+    case 'A_full'
+        z_u=laplacian_1d_fft_solve(rhs(1:N),params);
+        z_v=laplacian_1d_fft_solve(rhs(N+1:2*N),params);
+        z_w=laplacian_1d_fft_solve(rhs(2*N+1:3*N),params);
+        z_p=laplacian_1d_fft_solve(rhs(3*N+1:4*N),params);
+        z_rho=laplacian_1d_fft_solve(rhs(4*N+1:5*N),params);
+        z=[z_u;z_v;z_w;z_p;z_rho];
+    case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
+        z_u=laplacian_1d_fft_solve(rhs(1:N),params);
+        z_v=laplacian_1d_fft_solve(rhs(N+1:2*N),params);
+        z_p=laplacian_1d_fft_solve(rhs(2*N+1:3*N),params);
+        z=[z_u;z_v;z_p];
+    otherwise
+        error('Wrong option of params.operator');
+end
+end
+
+function Bq=apply_primitive_B(q,params)
+% Apply the singular mass matrix for the primitive-variable formulation.
+N=params.N;
+
+switch params.operator
+    case 'A_full'
+        % State ordering is [u;v;w;p;rho].  Pressure is algebraic.
+        Bq=[q(1:3*N);zeros(N,1,'like',q);q(4*N+1:5*N)];
+    case {'A0','A0_viscous','A0_adj','A0_adj_viscous'}
+        % State ordering is [u;v;p].  Pressure is algebraic.
+        Bq=[q(1:2*N);zeros(N,1,'like',q)];
+    otherwise
+        error('Wrong option of params.operator');
+end
+end
+
+function Aq=apply_raw_primitive_A(q,params)
+% Apply the primitive-variable matrix A (without shift inversion).
+    switch params.operator
+        case 'A_full'
+
+            N=params.N;
+            Ny=params.Ny;
+            Nx=params.Nx;
+
+            u=reshape(q(1:N),Ny,Nx);
+            v=reshape(q(N+1:2*N),Ny,Nx);
+            w=reshape(q(2*N+1:3*N),Ny,Nx);
+            p=reshape(q(3*N+1:4*N),Ny,Nx);
+            rho=reshape(q(4*N+1:5*N),Ny,Nx);
+            
+            kz=params.kz;
+            Re=params.Re;
+            Pr=params.Pr;
+            Fr=params.Fr;
+            
+            A_u=-advection(u,params)-u.*params.dUdx-v.*params.dUdy-dx(p,params)+1/Re*laplacian(u,params);
+            A_v=-advection(v,params)-u.*params.dVdx-v.*params.dVdy-dy(p,params)+1/Re*laplacian(v,params);
+            A_w=-advection(w,params)-(1i*kz*p)+1/Re*laplacian(w,params)-1/Fr^2*rho;
+            A_p=dx(u,params)+dy(v,params)+1i*kz*w;
+            A_rho=-advection(rho,params)+w+1/(Re*Pr)*laplacian(rho,params);
+
+            Aq=[reshape(A_u,[N,1]);
+                reshape(A_v,[N,1]);
+                reshape(A_w,[N,1]);
+                reshape(A_p,[N,1]);
+                reshape(A_rho,[N,1])];
+        case 'A0_viscous'
+            
+        case 'A0_adj_viscous'
+            
+        otherwise 
+            error('Wrong option of params.operator');
+    end
 end
 
 function value=advection(f,params)
